@@ -1,0 +1,310 @@
+"""
+allan_analysis.py  –  Best-of-both Allan deviation analysis for IMU data
+-------------------------------------------------------------------------
+
+run:
+    python AlanAnalysis.py --input imu_data.csv --out allan_plot.png [--fs 400]
+
+CSV must have columns: t, ax, ay, az, gx, gy, gz
+"""
+
+import argparse
+import sys
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+PI = np.pi
+
+# ---------------------------------------------------------------------------
+# Allan deviation
+# ---------------------------------------------------------------------------
+
+def allan_deviation(data: np.ndarray, fs: float):
+    N  = len(data)
+    dt = 1.0 / fs
+    max_n = N // 3
+
+    if max_n < 2:
+        raise ValueError("Not enough samples for Allan deviation (need at least 6).")
+
+    n_values = np.unique(
+        np.round(np.logspace(0, np.log10(max_n), 400)).astype(int)
+    )
+
+    cum = np.cumsum(np.insert(data, 0, 0.0))
+    tau_list, adev_list = [], []
+
+    for n in n_values:
+        avg  = (cum[n:] - cum[:-n]) / n  
+        if len(avg) < 2 * n:
+            break
+        diff = avg[n:] - avg[:-n]      
+        avar = 0.5 * np.mean(diff ** 2)
+        tau_list.append(n * dt)
+        adev_list.append(np.sqrt(avar))
+
+    return np.array(tau_list), np.array(adev_list)
+
+
+def geometric_mean_adev(meas: np.ndarray, fs: float):
+    per_axis = []
+    tau_ref  = None
+
+    for ax in range(3):
+        tau, adev = allan_deviation(meas[ax], fs)
+        if tau_ref is None:
+            tau_ref = tau
+        per_axis.append(adev)
+
+    avg = np.exp(np.mean(np.log(per_axis), axis=0))
+    return tau_ref, avg, per_axis
+
+
+# ---------------------------------------------------------------------------
+# Fitting helper  (curve_fit)
+# ---------------------------------------------------------------------------
+
+def _linear_log(log_x, a, b):
+    """Line in log-space: log(y) = a*log(x) + b."""
+    return a * log_x + b
+
+
+def fit_fixed_slope(tau: np.ndarray, adev: np.ndarray, slope: float,
+                    tau_range: tuple):
+    """
+    Fit log(adev) = slope * log(tau) + b over tau_range using curve_fit.
+
+    """
+    lo, hi = tau_range
+    mask = (tau >= lo) & (tau <= hi)
+    if mask.sum() < 2:
+        return np.nan
+
+    log_tau  = np.log(tau[mask])
+    log_adev = np.log(adev[mask])
+
+    try:
+        coefs, _ = curve_fit(
+            _linear_log, log_tau, log_adev,
+            bounds=([slope - 1e-6, -np.inf], [slope + 1e-6, np.inf])
+        )
+        return float(coefs[1])          # return b (offset)
+    except RuntimeError:
+        return np.nan
+
+
+def fit_line(tau: np.ndarray, offset: float, slope: float) -> np.ndarray:
+    """Reconstruct fitted curve from log-space parameters."""
+    return np.exp(offset + slope * np.log(tau))
+
+
+# ---------------------------------------------------------------------------
+# Noise coefficient extraction
+# ---------------------------------------------------------------------------
+
+def extract_noise_params(tau: np.ndarray, adev: np.ndarray):
+    """
+    Extract white noise (ARW/VRW), rate random walk, and bias instability.
+
+    Returns a dict with all coefficients and plotting helpers.
+    """
+    # ---- White noise  (slope = -0.5, read at tau = 1 s) -------------------
+    wn_hi  = min(1.0, tau[-1])
+    off_wn = fit_fixed_slope(tau, adev, -0.5, (tau[0], wn_hi))
+    sigma_wn = np.exp(off_wn) if not np.isnan(off_wn) else np.nan   # at tau=1
+
+    # ---- Rate random walk  (slope = +0.5, read at tau = 3 s) --------------
+    rw_hi  = min(0.8 * tau[-1], tau[-1])
+    rw_lo  = max(3.0, rw_hi / 4.0)
+    off_rw = fit_fixed_slope(tau, adev, +0.5, (rw_lo, rw_hi))
+
+    # coefficient K is read at tau = 3 s
+    sigma_rw = np.exp(off_rw + 0.5 * np.log(3.0)) if not np.isnan(off_rw) else np.nan
+
+    # ---- Bias instability -------
+    idx_bi  = np.argmin(adev)
+    tau_bi  = tau[idx_bi]
+    bi      = adev[idx_bi]
+    #caling: B (psd) = adev_min / sqrt(2*ln2/pi)
+    scf_b   = np.sqrt(2 * np.log(2) / PI)
+    b_coeff = bi / scf_b
+
+    return dict(
+        # white noise
+        sigma_wn=sigma_wn, off_wn=off_wn,
+        # rate random walk
+        sigma_rw=sigma_rw, off_rw=off_rw, rw_lo=rw_lo, rw_hi=rw_hi,
+        # bias instability
+        bi=bi, tau_bi=tau_bi, b_coeff=b_coeff, scf_b=scf_b,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_adev_panel(ax_plot, tau, adev_avg, adevs, label, unit, params):
+    
+    colors = ["tab:blue", "tab:orange", "tab:green"]
+    axis_labels = "xyz"
+
+    # Per-axis
+    for i, adev in enumerate(adevs):
+        ax_plot.plot(tau, adev, color=colors[i], alpha=0.30, lw=0.9,
+                     label=f"axis {axis_labels[i]}")
+
+    # Geometric mean
+    ax_plot.plot(tau, adev_avg, "k--", lw=1.8, label="geometric mean")
+
+    p = params
+
+    # ---- White noise line --------------------------------------------------
+    if not np.isnan(p["off_wn"]):
+        line_wn = fit_line(tau, p["off_wn"], -0.5)
+        ax_plot.plot(tau, line_wn, color="red", lw=2,
+                     ls="--", label=r"white noise $\sigma_N$ (slope −½)")
+        tau_n  = 1.0
+        val_n  = p["sigma_wn"]
+        ax_plot.scatter([tau_n], [val_n], marker="o", s=80, color="red", zorder=7)
+        ax_plot.annotate(f"N = {val_n:.3e}",
+                         xy=(tau_n, val_n), xytext=(tau_n * 1.3, val_n * 1.3),
+                         fontsize=8, color="red",
+                         arrowprops=dict(arrowstyle="->", color="red", lw=0.8))
+
+    # ---- Rate random walk line ---------------------------------------------
+    if not np.isnan(p["off_rw"]):
+        tau_fit  = tau[(tau >= p["rw_lo"]) & (tau <= p["rw_hi"])]
+        line_rw  = fit_line(tau_fit, p["off_rw"], +0.5)
+        ax_plot.plot(tau_fit, line_rw, color="purple", lw=2,
+                     ls="--", label=r"rate random walk $\sigma_K$ (slope +½)")
+        tau_k  = 3.0
+        val_k  = p["sigma_rw"]
+        ax_plot.scatter([tau_k], [val_k], marker="D", s=70, color="purple", zorder=7)
+        ax_plot.annotate(f"K = {val_k:.3e}",
+                         xy=(tau_k, val_k), xytext=(tau_k * 1.4, val_k * 0.7),
+                         fontsize=8, color="purple",
+                         arrowprops=dict(arrowstyle="->", color="purple", lw=0.8))
+
+    # ---- Bias instability --------------------------------------------------
+    bi_line = p["scf_b"] * p["b_coeff"]    
+    ax_plot.axhline(bi_line, color="teal", lw=1.5, ls="--",
+                    label=r"bias instability $\sigma_B$")
+    ax_plot.scatter([p["tau_bi"]], [bi_line], marker="^", s=120,
+                    color="teal", zorder=7)
+    ax_plot.annotate(f"B = {p['b_coeff']:.3e}",
+                     xy=(p["tau_bi"], bi_line),
+                     xytext=(p["tau_bi"] * 1.4, bi_line * 1.3),
+                     fontsize=8, color="teal",
+                     arrowprops=dict(arrowstyle="->", color="teal", lw=0.8))
+
+    ax_plot.set_xscale("log")
+    ax_plot.set_yscale("log")
+    ax_plot.set_xlabel(r"Integration time $\tau$ [s]")
+    ax_plot.set_ylabel(f"Allan deviation [{unit}]")
+    ax_plot.set_title(label)
+    ax_plot.grid(True, which="both", alpha=0.3)
+    ax_plot.legend(fontsize=8, loc="lower left")
+
+
+def print_report(input_path, fs,
+                 accel_mean, gyro_mean,
+                 tau_a, params_a,
+                 tau_g, params_g):
+    SEP = "=" * 68
+    print(SEP)
+    print("  IMU ALLAN DEVIATION ANALYSIS REPORT")
+    print(SEP)
+    print(f"  Input file :  {input_path}")
+    print(f"  Sample rate:  {fs:.4f} Hz")
+    print()
+
+    print("  ACCELEROMETER")
+    print("  " + "-" * 40)
+    for i, ax in enumerate("xyz"):
+        print(f"    Mean level {ax}:           {accel_mean[i]:+.6e} m/s²")
+    print(f"    White-noise coeff N:   {params_a['sigma_wn']:.6e}  (at τ=1 s)")
+    print(f"    Rate-RW coeff K:       {params_a['sigma_rw']:.6e}  (at τ=3 s)")
+    print(f"    Bias instability B:    {params_a['b_coeff']:.6e}  (at τ={params_a['tau_bi']:.3f} s)")
+    print()
+
+    print("  GYROSCOPE")
+    print("  " + "-" * 40)
+    for i, ax in enumerate("xyz"):
+        print(f"    Mean offset {ax}:          {gyro_mean[i]:+.6e} rad/s")
+    print(f"    White-noise coeff N:   {params_g['sigma_wn']:.6e}  (at τ=1 s)")
+    print(f"    Rate-RW coeff K:       {params_g['sigma_rw']:.6e}  (at τ=3 s)")
+    print(f"    Bias instability B:    {params_g['b_coeff']:.6e}  (at τ={params_g['tau_bi']:.3f} s)")
+    print(SEP)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Allan deviation analysis"
+    )
+    parser.add_argument("--input", type=str, required=True,
+                        help="CSV with columns: [t,] ax, ay, az, gx, gy, gz")
+    parser.add_argument("--out",   type=str, default="allan_deviation.png",
+                        help="Output plot path (default: allan_deviation.png)")
+    parser.add_argument("--fs",    type=float, default=None,
+                        help="Sampling rate [Hz]. Inferred from 't' column if omitted.")
+    args = parser.parse_args()
+
+    # ---- Load data ------
+    df = pd.read_csv(args.input)
+
+    required = {"ax", "ay", "az", "gx", "gy", "gz"}
+    missing  = required - set(df.columns)
+    if missing:
+        sys.exit(f"ERROR: Missing columns: {sorted(missing)}")
+
+    if args.fs is not None:
+        fs = args.fs
+    elif "t" in df.columns:
+        t  = df["t"].to_numpy()
+        dt = np.median(np.diff(t))
+        if dt <= 0:
+            sys.exit("ERROR: Non-positive dt inferred from 't' column.")
+        fs = 1.0 / dt
+    else:
+        sys.exit("ERROR: Provide --fs or include a 't' column in the CSV.")
+
+    accel_meas = np.vstack([df["ax"], df["ay"], df["az"]])
+    gyro_meas  = np.vstack([df["gx"], df["gy"], df["gz"]])
+
+    accel_mean = accel_meas.mean(axis=1)
+    gyro_mean  = gyro_meas.mean(axis=1)
+
+    # ---- Compute -------
+    tau_a, adev_a_avg, adevs_a = geometric_mean_adev(accel_meas, fs)
+    tau_g, adev_g_avg, adevs_g = geometric_mean_adev(gyro_meas,  fs)
+
+    params_a = extract_noise_params(tau_a, adev_a_avg)
+    params_g = extract_noise_params(tau_g, adev_g_avg)
+
+   
+    print_report(args.input, fs,
+                 accel_mean, gyro_mean,
+                 tau_a, params_a,
+                 tau_g, params_g)
+
+    # ---- Plot -----------
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig.suptitle("Allan Deviation Analysis", fontsize=13, fontweight="bold")
+
+    plot_adev_panel(axes[0], tau_a, adev_a_avg, adevs_a,
+                    label="Accelerometer", unit="m/s²", params=params_a)
+
+    plot_adev_panel(axes[1], tau_g, adev_g_avg, adevs_g,
+                    label="Gyroscope", unit="rad/s", params=params_g)
+
+    plt.tight_layout()
+    plt.savefig(args.out, dpi=150, bbox_inches="tight")
+    print(f"\nPlot saved → {args.out}")
+
+
+if __name__ == "__main__":
+    main()
